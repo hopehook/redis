@@ -4446,6 +4446,9 @@ int handleClientsWithPendingReadsUsingThreads(void) {
         /* Once io-threads are idle we can update the client in the mem usage */
         updateClientMemUsage(c);
 
+        // 主线程才可以执行真正的 command 操作, 确保原子性
+        //
+        // 所以，即使使用多I/O线程，其实 `命令执行阶段` 也是由 主线程 完成，所有命令执行的原子性仍得到保证，即不会破坏分布式锁的原子性。
         if (processPendingCommandAndInputBuffer(c) == C_ERR) {
             /* If the client is no longer valid, we avoid
              * processing the client later. So we just go

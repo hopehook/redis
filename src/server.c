@@ -1520,6 +1520,12 @@ extern int ProcessingEventsWhileBlocked;
  *
  * The most important is freeClientsInAsyncFreeQueue but we also
  * call some other low-risk functions. */
+
+
+// 在 beforeSleep 里会依次处理两个任务队列。
+// 先处理读任务队列，解析其中的请求，并处理之。
+// 然后将处理结果写到缓存中，同时写到写任务队列中。
+// 紧接着 beforeSleep 会进入写任务队列处理，会将处理结果写到 socket 里，进行真正的数据发送。
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 
@@ -1534,6 +1540,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * events to handle. */
     if (ProcessingEventsWhileBlocked) {
         uint64_t processed = 0;
+
+        // *处理读任务队列
+        // 主线程在处理完后会等待其它的 io 线程处理。在所有的读请求都处理完后，主线程 beforeSleep 中对
+        // handleClientsWithPendingReadsUsingThreads 的调用就结束了。
         processed += handleClientsWithPendingReadsUsingThreads();
         processed += tlsProcessPendingData();
         if (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE)
@@ -1629,6 +1639,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         flushAppendOnlyFile(0);
 
     /* Handle writes with pending output buffers. */
+    // *处理写任务队列
+    //
+    // 当所有的写请求也处理完后，beforeSleep 就退出了。
+    // 主线程将会再次调用 epoll_wait 来发现请求，进入下一轮的用户请求处理。
     handleClientsWithPendingWritesUsingThreads();
 
     /* Close clients that need to be closed asynchronous */
@@ -2388,6 +2402,12 @@ void makeThreadKillable(void) {
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
 }
 
+
+// initServer:
+//  - 初始化读任务队列、写任务队列
+//  - 创建一个 epoll 对象
+//  - 对配置的监听端口进行 listen
+//  - 把 listen socket 让 epoll 给管理起来
 void initServer(void) {
     int j;
 
@@ -2416,8 +2436,14 @@ void initServer(void) {
     server.clients_to_close = listCreate();
     server.slaves = listCreate();
     server.monitors = listCreate();
+
+    // 1 初始化读任务队列、写任务队列
+    //
+    // 将来主线程产生的任务都会放在放在这两个任务队列里。
+    // 主线程会根据这两个任务队列来进行任务哈希散列，以将任务分配到 `多个线程` 中进行处理。
     server.clients_pending_write = listCreate();
     server.clients_pending_read = listCreate();
+
     server.clients_timeout_table = raxNew();
     server.replication_allowed = 1;
     server.slaveseldb = -1; /* Force to emit the first SELECT command. */
@@ -2456,6 +2482,8 @@ void initServer(void) {
     adjustOpenFilesLimit();
     const char *clk_msg = monotonicInit();
     serverLog(LL_NOTICE, "monotonic clock: %s", clk_msg);
+
+    // 2 初始化回调 events，创建 epoll
     server.el = aeCreateEventLoop(server.maxclients+CONFIG_FDSET_INCR);
     if (server.el == NULL) {
         serverLog(LL_WARNING,
@@ -2466,12 +2494,14 @@ void initServer(void) {
     server.db = zmalloc(sizeof(redisDb)*server.dbnum);
 
     /* Open the TCP listening socket for the user commands. */
+    // 3 绑定监听服务端口
     if (server.port != 0 &&
         listenToPort(server.port,&server.ipfd) == C_ERR) {
         /* Note: the following log text is matched by the test suite. */
         serverLog(LL_WARNING, "Failed listening on port %u (TCP), aborting.", server.port);
         exit(1);
     }
+
     if (server.tls_port != 0 &&
         listenToPort(server.tls_port,&server.tlsfd) == C_ERR) {
         /* Note: the following log text is matched by the test suite. */
@@ -2581,6 +2611,9 @@ void initServer(void) {
 
     /* Create an event handler for accepting new connections in TCP and Unix
      * domain sockets. */
+    // 4 注册 accept 事件处理器
+    // listen fd 对应的读回调函数 rfileProc 事实上就被设置成了 acceptTcpHandler，
+    // 写回调没有设置，私有数据 client_data 也为 null。
     if (createSocketAcceptHandler(&server.ipfd, acceptTcpHandler) != C_OK) {
         serverPanic("Unrecoverable error creating TCP socket accept handler.");
     }
@@ -2633,6 +2666,8 @@ void initServer(void) {
  * see: https://sourceware.org/bugzilla/show_bug.cgi?id=19329 */
 void InitServerLast() {
     bioInit();
+
+    // 创建多个 io 线程
     initThreadedIO();
     set_jemalloc_bg_thread(server.jemalloc_bg_thread);
     server.initial_memory_usage = zmalloc_used_memory();
@@ -3316,7 +3351,10 @@ void call(client *c, int flags) {
         monotonic_start = getMonotonicUs();
 
     server.in_nested_call++;
+
+    // 调用命令处理函数
     c->cmd->proc(c);
+
     server.in_nested_call--;
 
     /* In order to avoid performance implication due to querying the clock using a system call 3 times,
@@ -6984,7 +7022,9 @@ int main(int argc, char **argv) {
         serverLog(LL_WARNING, "Configuration loaded");
     }
 
+    // 1.1 主线程初始化
     initServer();
+
     if (background || server.pidfile) createPidFile();
     if (server.set_proc_title) redisSetProcTitle(NULL);
     redisAsciiArt();
@@ -7020,6 +7060,8 @@ int main(int argc, char **argv) {
         moduleInitModulesSystemLast();
         moduleLoadFromQueue();
         ACLLoadUsersAtStartup();
+
+        // 1.2 启动 io 线程
         InitServerLast();
         aofLoadManifestFromDisk();
         loadDataFromDisk();
@@ -7063,6 +7105,7 @@ int main(int argc, char **argv) {
     redisSetCpuAffinity(server.server_cpulist);
     setOOMScoreAdj(-1);
 
+    // 进入事件循环
     aeMain(server.el);
     aeDeleteEventLoop(server.el);
     return 0;

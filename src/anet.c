@@ -407,6 +407,7 @@ int anetUnixGenericConnect(char *err, const char *path, int flags)
     return s;
 }
 
+// 在 anetListen 中，就是简单的 bind 和 listen 的调用。
 static int anetListen(char *err, int s, struct sockaddr *sa, socklen_t len, int backlog) {
     if (bind(s,sa,len) == -1) {
         anetSetError(err, "bind: %s", strerror(errno));
@@ -457,6 +458,8 @@ static int _anetTcpServer(char *err, int port, char *bindaddr, int af, int backl
 
         if (af == AF_INET6 && anetV6Only(err,s) == ANET_ERR) goto error;
         if (anetSetReuseAddr(err,s) == ANET_ERR) goto error;
+
+        // listen 入口
         if (anetListen(err,s,p->ai_addr,p->ai_addrlen,backlog) == ANET_ERR) s = ANET_ERR;
         goto end;
     }

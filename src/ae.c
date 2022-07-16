@@ -71,7 +71,10 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     monotonicInit();    /* just in case the calling app didn't initialize */
 
     if ((eventLoop = zmalloc(sizeof(*eventLoop))) == NULL) goto err;
+
+    // 将来的各种回调事件就都会存在这里
     eventLoop->events = zmalloc(sizeof(aeFileEvent)*setsize);
+
     eventLoop->fired = zmalloc(sizeof(aeFiredEvent)*setsize);
     if (eventLoop->events == NULL || eventLoop->fired == NULL) goto err;
     eventLoop->setsize = setsize;
@@ -82,6 +85,8 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     eventLoop->beforesleep = NULL;
     eventLoop->aftersleep = NULL;
     eventLoop->flags = 0;
+
+    // epoll_create 入口
     if (aeApiCreate(eventLoop) == -1) goto err;
     /* Events with mask == AE_NONE are not set. So let's initialize the
      * vector with it. */
@@ -162,14 +167,21 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         errno = ERANGE;
         return AE_ERR;
     }
+
+    // 取出一个文件事件结构
     aeFileEvent *fe = &eventLoop->events[fd];
 
+    // 监听指定 fd 的指定事件
     if (aeApiAddEvent(eventLoop, fd, mask) == -1)
         return AE_ERR;
+
+    // 设置文件事件类型，以及事件的处理器
     fe->mask |= mask;
-    if (mask & AE_READABLE) fe->rfileProc = proc;
-    if (mask & AE_WRITABLE) fe->wfileProc = proc;
-    fe->clientData = clientData;
+    if (mask & AE_READABLE) fe->rfileProc = proc;  // 读事件回调
+    if (mask & AE_WRITABLE) fe->wfileProc = proc;  // 写事件回调
+
+    // 私有数据
+    fe->clientData = clientData;  // 一些额外的扩展数据
     if (fd > eventLoop->maxfd)
         eventLoop->maxfd = fd;
     return AE_OK;
@@ -354,6 +366,9 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
  * if flags has AE_CALL_BEFORE_SLEEP set, the beforesleep callback is called.
  *
  * The function returns the number of events processed. */
+
+// 在 aeProcessEvents 中假如 aeApiPoll(epoll_wait) 中的事件都处理完了以后，
+// 则会进入下一次的循环再次进入 aeProcessEvents。
 int aeProcessEvents(aeEventLoop *eventLoop, int flags)
 {
     int processed = 0, numevents;
@@ -396,11 +411,14 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             tvp = &tv;
         }
 
+        // 2.3, 2.4 事件循环处理3：epoll_wait 前进行读写任务队列处理
         if (eventLoop->beforesleep != NULL && flags & AE_CALL_BEFORE_SLEEP)
             eventLoop->beforesleep(eventLoop);
 
         /* Call the multiplexing API, will return only on timeout or when
          * some event fires. */
+
+        // *epoll_wait 发现事件并进行处理
         numevents = aeApiPoll(eventLoop, tvp);
 
         /* After sleep callback. */
@@ -409,6 +427,8 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
 
         for (j = 0; j < numevents; j++) {
             int fd = eventLoop->fired[j].fd;
+
+            // 从已就绪数组中获取事件
             aeFileEvent *fe = &eventLoop->events[fd];
             int mask = eventLoop->fired[j].mask;
             int fired = 0; /* Number of events fired for current fd. */
@@ -433,6 +453,10 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
              * Fire the readable event if the call sequence is not
              * inverted. */
             if (!invert && fe->mask & mask & AE_READABLE) {
+
+                // 如果是读事件，并且有读回调函数
+                // 2.1 如果是 listen socket 读事件，则处理 `新连接请求`
+                // 2.2 如果是客户连接 socket 读事件，处理客户连接上的 `读请求`
                 fe->rfileProc(eventLoop,fd,fe->clientData,mask);
                 fired++;
                 fe = &eventLoop->events[fd]; /* Refresh in case of resize. */
@@ -441,6 +465,8 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             /* Fire the writable event. */
             if (fe->mask & mask & AE_WRITABLE) {
                 if (!fired || fe->wfileProc != fe->rfileProc) {
+
+                    // 如果是写事件，并且有写回调函数
                     fe->wfileProc(eventLoop,fd,fe->clientData,mask);
                     fired++;
                 }
@@ -493,6 +519,9 @@ int aeWait(int fd, int mask, long long milliseconds) {
 void aeMain(aeEventLoop *eventLoop) {
     eventLoop->stop = 0;
     while (!eventLoop->stop) {
+        // 其中 aeProcessEvents 就是所谓的事件分发器。
+        // 它通过调用 epoll_wait 来发现所发生的各种事件，
+        // 然后调用事先注册好的处理函数进行处理。
         aeProcessEvents(eventLoop, AE_ALL_EVENTS|
                                    AE_CALL_BEFORE_SLEEP|
                                    AE_CALL_AFTER_SLEEP);
